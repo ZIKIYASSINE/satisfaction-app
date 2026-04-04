@@ -1,21 +1,30 @@
 require("dotenv").config();
 const express = require("express");
-const cors = require("cors");
+const cors    = require("cors");
 const { Pool } = require("pg");
 const { v4: uuidv4 } = require("uuid");
+const bcrypt  = require("bcryptjs");
+const jwt     = require("jsonwebtoken");
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3001;
+const JWT_SECRET = process.env.JWT_SECRET || "arwamedic_secret_2026";
 
-// ─── DB Connection ────────────────────────────────────────────────────────────
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false,
 });
 
-// ─── Init Tables ─────────────────────────────────────────────────────────────
 async function initDB() {
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id            TEXT PRIMARY KEY,
+      name          TEXT NOT NULL,
+      email         TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role          TEXT NOT NULL DEFAULT 'user',
+      created_at    TIMESTAMPTZ DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS exercises (
       id          TEXT PRIMARY KEY,
       title       TEXT NOT NULL,
@@ -25,209 +34,223 @@ async function initDB() {
       status      TEXT NOT NULL DEFAULT 'active',
       created_at  TIMESTAMPTZ DEFAULT NOW()
     );
-
     CREATE TABLE IF NOT EXISTS responses (
       id           TEXT PRIMARY KEY,
       exercise_id  TEXT NOT NULL REFERENCES exercises(id) ON DELETE CASCADE,
+      user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       answers      JSONB NOT NULL DEFAULT '{}',
       percentage   INTEGER NOT NULL,
-      device_hash  TEXT,
-      submitted_at TIMESTAMPTZ DEFAULT NOW()
+      submitted_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(exercise_id, user_id)
     );
-
     CREATE INDEX IF NOT EXISTS idx_responses_exercise ON responses(exercise_id);
+    CREATE INDEX IF NOT EXISTS idx_responses_user ON responses(user_id);
   `);
+
+  const admin = await pool.query("SELECT id FROM users WHERE role='admin' LIMIT 1");
+  if (!admin.rows.length) {
+    const hash = await bcrypt.hash(process.env.ADMIN_PASSWORD || "Admin@2026", 10);
+    await pool.query(
+      "INSERT INTO users (id,name,email,password_hash,role) VALUES ($1,$2,$3,$4,'admin')",
+      [uuidv4(), "Administrateur", process.env.ADMIN_EMAIL || "admin@arwamedic.ma", hash]
+    );
+    console.log("✅ Admin créé: admin@arwamedic.ma / Admin@2026");
+  }
   console.log("✅ DB initialized");
 }
 
-// ─── Middleware ───────────────────────────────────────────────────────────────
-const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(",")
-  : ["http://localhost:5173", "http://localhost:3000"];
-
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:5173").split(",");
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // allow Postman etc.
+    if (!origin) return cb(null, true);
     if (allowedOrigins.some(o => origin.startsWith(o.trim()))) return cb(null, true);
-    cb(new Error("CORS not allowed: " + origin));
+    cb(new Error("CORS: " + origin));
   },
   credentials: true,
 }));
 app.use(express.json());
 
-// ─── Health ───────────────────────────────────────────────────────────────────
+const auth = (roles = []) => (req, res, next) => {
+  const h = req.headers.authorization;
+  if (!h?.startsWith("Bearer ")) return res.status(401).json({ error: "Token manquant" });
+  try {
+    const p = jwt.verify(h.split(" ")[1], JWT_SECRET);
+    if (roles.length && !roles.includes(p.role)) return res.status(403).json({ error: "Accès refusé" });
+    req.user = p;
+    next();
+  } catch { res.status(401).json({ error: "Token invalide" }); }
+};
+
 app.get("/health", (_, res) => res.json({ status: "ok", ts: new Date() }));
 
-// ─── EXERCISES ────────────────────────────────────────────────────────────────
-
-// GET /api/exercises
-app.get("/api/exercises", async (_, res) => {
+// AUTH
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "Email et mot de passe requis" });
   try {
-    const { rows } = await pool.query(
-      "SELECT * FROM exercises ORDER BY created_at DESC"
-    );
+    const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email.toLowerCase()]);
+    if (!rows.length) return res.status(401).json({ error: "Identifiants incorrects" });
+    const ok = await bcrypt.compare(password, rows[0].password_hash);
+    if (!ok) return res.status(401).json({ error: "Identifiants incorrects" });
+    const u = rows[0];
+    const token = jwt.sign({ id:u.id, name:u.name, email:u.email, role:u.role }, JWT_SECRET, { expiresIn:"7d" });
+    res.json({ token, user: { id:u.id, name:u.name, email:u.email, role:u.role } });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/api/auth/me", auth(), (req, res) => res.json(req.user));
+
+// USERS (admin)
+app.get("/api/users", auth(["admin"]), async (_, res) => {
+  try {
+    const { rows } = await pool.query("SELECT id,name,email,role,created_at FROM users ORDER BY created_at DESC");
     res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/exercises/:id  (public — pour l'enquête utilisateur)
-app.get("/api/exercises/:id", async (req, res) => {
+app.post("/api/users", auth(["admin"]), async (req, res) => {
+  const { name, email, password, role="user" } = req.body;
+  if (!name || !email || !password) return res.status(400).json({ error: "Champs manquants" });
   try {
+    const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query(
-      "SELECT * FROM exercises WHERE id = $1", [req.params.id]
-    );
-    if (!rows.length) return res.status(404).json({ error: "Not found" });
-    res.json(rows[0]);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// POST /api/exercises
-app.post("/api/exercises", async (req, res) => {
-  const { title, month, year, questions } = req.body;
-  if (!title || month === undefined || !year || !questions)
-    return res.status(400).json({ error: "Champs manquants" });
-  try {
-    const id = uuidv4();
-    const { rows } = await pool.query(
-      `INSERT INTO exercises (id, title, month, year, questions, status)
-       VALUES ($1,$2,$3,$4,$5,'active') RETURNING *`,
-      [id, title, month, year, JSON.stringify(questions)]
+      "INSERT INTO users (id,name,email,password_hash,role) VALUES ($1,$2,$3,$4,$5) RETURNING id,name,email,role,created_at",
+      [uuidv4(), name, email.toLowerCase(), hash, role]
     );
     res.status(201).json(rows[0]);
-  } catch (e) {
+  } catch(e) {
+    if (e.code==="23505") return res.status(409).json({ error: "Email déjà utilisé" });
     res.status(500).json({ error: e.message });
   }
 });
 
-// PATCH /api/exercises/:id/status
-app.patch("/api/exercises/:id/status", async (req, res) => {
-  const { status } = req.body;
-  if (!["active", "closed"].includes(status))
-    return res.status(400).json({ error: "Status invalide" });
+app.patch("/api/users/:id/password", auth(["admin"]), async (req, res) => {
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ error: "Mot de passe requis" });
   try {
-    const { rows } = await pool.query(
-      "UPDATE exercises SET status=$1 WHERE id=$2 RETURNING *",
-      [status, req.params.id]
-    );
+    const hash = await bcrypt.hash(password, 10);
+    await pool.query("UPDATE users SET password_hash=$1 WHERE id=$2", [hash, req.params.id]);
+    res.json({ updated: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete("/api/users/:id", auth(["admin"]), async (req, res) => {
+  try {
+    await pool.query("DELETE FROM users WHERE id=$1 AND role!='admin'", [req.params.id]);
+    res.json({ deleted: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// EXERCISES
+app.get("/api/exercises", auth(), async (_, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM exercises ORDER BY created_at DESC");
+    res.json(rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/api/exercises/:id", auth(), async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM exercises WHERE id=$1", [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.json(rows[0]);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// DELETE /api/exercises/:id
-app.delete("/api/exercises/:id", async (req, res) => {
+app.post("/api/exercises", auth(["admin"]), async (req, res) => {
+  const { title, month, year, questions } = req.body;
+  if (!title || month===undefined || !year || !questions) return res.status(400).json({ error: "Champs manquants" });
+  try {
+    const { rows } = await pool.query(
+      "INSERT INTO exercises (id,title,month,year,questions,status) VALUES ($1,$2,$3,$4,$5,'active') RETURNING *",
+      [uuidv4(), title, month, year, JSON.stringify(questions)]
+    );
+    res.status(201).json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch("/api/exercises/:id/status", auth(["admin"]), async (req, res) => {
+  const { status } = req.body;
+  if (!["active","closed"].includes(status)) return res.status(400).json({ error: "Status invalide" });
+  try {
+    const { rows } = await pool.query("UPDATE exercises SET status=$1 WHERE id=$2 RETURNING *", [status, req.params.id]);
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete("/api/exercises/:id", auth(["admin"]), async (req, res) => {
   try {
     await pool.query("DELETE FROM exercises WHERE id=$1", [req.params.id]);
     res.json({ deleted: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── RESPONSES ───────────────────────────────────────────────────────────────
-
-// POST /api/exercises/:id/responses
-app.post("/api/exercises/:id/responses", async (req, res) => {
-  const { answers, percentage, deviceHash } = req.body;
-  if (!answers || percentage === undefined)
-    return res.status(400).json({ error: "Données manquantes" });
-
+// RESPONSES
+app.post("/api/exercises/:id/responses", auth(), async (req, res) => {
+  const { answers, percentage } = req.body;
+  if (!answers || percentage===undefined) return res.status(400).json({ error: "Données manquantes" });
   try {
-    // Vérifier que l'exercice existe et est actif
-    const ex = await pool.query(
-      "SELECT * FROM exercises WHERE id=$1", [req.params.id]
-    );
+    const ex = await pool.query("SELECT * FROM exercises WHERE id=$1", [req.params.id]);
     if (!ex.rows.length) return res.status(404).json({ error: "Exercice introuvable" });
-    if (ex.rows[0].status === "closed")
-      return res.status(403).json({ error: "Enquête fermée" });
-
-    // Anti-doublon par deviceHash
-    if (deviceHash) {
-      const already = await pool.query(
-        "SELECT id FROM responses WHERE exercise_id=$1 AND device_hash=$2",
-        [req.params.id, deviceHash]
-      );
-      if (already.rows.length)
-        return res.status(409).json({ error: "Déjà répondu" });
-    }
-
-    const id = uuidv4();
+    if (ex.rows[0].status==="closed") return res.status(403).json({ error: "Enquête fermée" });
     const { rows } = await pool.query(
-      `INSERT INTO responses (id, exercise_id, answers, percentage, device_hash)
-       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [id, req.params.id, JSON.stringify(answers), percentage, deviceHash || null]
+      `INSERT INTO responses (id,exercise_id,user_id,answers,percentage)
+       VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (exercise_id,user_id) DO UPDATE SET answers=$4,percentage=$5,submitted_at=NOW()
+       RETURNING *`,
+      [uuidv4(), req.params.id, req.user.id, JSON.stringify(answers), percentage]
     );
     res.status(201).json(rows[0]);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/exercises/:id/responses
-app.get("/api/exercises/:id/responses", async (req, res) => {
+app.get("/api/exercises/:id/responses", auth(["admin"]), async (req, res) => {
   try {
     const { rows } = await pool.query(
-      "SELECT * FROM responses WHERE exercise_id=$1 ORDER BY submitted_at DESC",
+      `SELECT r.*, u.name as user_name, u.email as user_email
+       FROM responses r JOIN users u ON u.id=r.user_id
+       WHERE r.exercise_id=$1 ORDER BY r.submitted_at DESC`,
       [req.params.id]
     );
     res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/stats  — statistiques globales + trimestrielles
-app.get("/api/stats", async (req, res) => {
+app.get("/api/exercises/:id/my-response", auth(), async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT * FROM responses WHERE exercise_id=$1 AND user_id=$2",
+      [req.params.id, req.user.id]
+    );
+    res.json(rows[0] || null);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// STATS
+app.get("/api/stats", auth(["admin"]), async (req, res) => {
   try {
     const year = parseInt(req.query.year) || new Date().getFullYear();
-
-    const exs = await pool.query("SELECT * FROM exercises WHERE year=$1", [year]);
-    const resps = await pool.query(
-      `SELECT r.* FROM responses r
-       JOIN exercises e ON e.id = r.exercise_id
-       WHERE e.year = $1`, [year]
+    const exs  = await pool.query("SELECT * FROM exercises WHERE year=$1", [year]);
+    const resp = await pool.query(
+      "SELECT r.* FROM responses r JOIN exercises e ON e.id=r.exercise_id WHERE e.year=$1", [year]
     );
-
     const quarters = { Q1:[0,1,2], Q2:[3,4,5], Q3:[6,7,8], Q4:[9,10,11] };
     const qStats = {};
-    for (const [q, months] of Object.entries(quarters)) {
-      const exInQ = exs.rows.filter(e => months.includes(e.month));
-      const rInQ  = resps.rows.filter(r =>
-        exInQ.some(e => e.id === r.exercise_id)
-      );
-      const avg = rInQ.length
-        ? Math.round(rInQ.reduce((a, r) => a + r.percentage, 0) / rInQ.length)
-        : 0;
-      qStats[q] = { exercises: exInQ.length, count: rInQ.length, avg };
+    for (const [q,months] of Object.entries(quarters)) {
+      const exInQ = exs.rows.filter(e=>months.includes(e.month));
+      const rInQ  = resp.rows.filter(r=>exInQ.some(e=>e.id===r.exercise_id));
+      qStats[q] = { exercises:exInQ.length, count:rInQ.length,
+        avg: rInQ.length ? Math.round(rInQ.reduce((a,r)=>a+r.percentage,0)/rInQ.length) : 0 };
     }
-
-    const allResps = await pool.query("SELECT percentage FROM responses");
-    const globalAvg = allResps.rows.length
-      ? Math.round(allResps.rows.reduce((a, r) => a + r.percentage, 0) / allResps.rows.length)
-      : 0;
-
-    res.json({
-      year,
-      globalAvg,
-      totalResponses: allResps.rows.length,
-      totalExercises: (await pool.query("SELECT COUNT(*) FROM exercises")).rows[0].count,
-      quarters: qStats,
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    const all = await pool.query("SELECT percentage FROM responses");
+    const globalAvg = all.rows.length ? Math.round(all.rows.reduce((a,r)=>a+r.percentage,0)/all.rows.length) : 0;
+    const totalUsers = (await pool.query("SELECT COUNT(*) FROM users WHERE role='user'")).rows[0].count;
+    res.json({ year, globalAvg, totalResponses:all.rows.length,
+      totalExercises:(await pool.query("SELECT COUNT(*) FROM exercises")).rows[0].count,
+      totalUsers, quarters:qStats });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── Start ────────────────────────────────────────────────────────────────────
-initDB().then(() => {
-  app.listen(PORT, () => console.log(`🚀 API running on port ${PORT}`));
-}).catch(err => {
-  console.error("❌ DB init failed:", err);
-  process.exit(1);
+initDB().then(() => app.listen(PORT, () => console.log(`🚀 API on port ${PORT}`))).catch(err=>{
+  console.error("❌ DB init failed:", err); process.exit(1);
 });

@@ -1,4 +1,4 @@
-name: Deploy Frontend to GitHub Pages
+name: Deploy Frontend → GitHub Pages
 
 on:
   push:
@@ -36,6 +36,7 @@ jobs:
       - name: Build
         working-directory: frontend
         env:
+          # ⚠️ À configurer dans GitHub → Settings → Secrets → Actions
           VITE_API_URL: ${{ secrets.VITE_API_URL }}
         run: npm run build
 

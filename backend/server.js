@@ -16,6 +16,7 @@ const pool = new Pool({
 });
 
 async function initDB() {
+  // 1. Créer les nouvelles tables
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id            TEXT PRIMARY KEY,
@@ -34,6 +35,21 @@ async function initDB() {
       status      TEXT NOT NULL DEFAULT 'active',
       created_at  TIMESTAMPTZ DEFAULT NOW()
     );
+  `);
+
+  // 2. Migration : supprimer l'ancienne table responses si elle a une structure incompatible
+  const cols = await pool.query(`
+    SELECT column_name FROM information_schema.columns
+    WHERE table_name='responses' AND column_name='user_id'
+  `);
+  if (cols.rows.length === 0) {
+    // Ancienne structure sans user_id → on recrée
+    await pool.query(`DROP TABLE IF EXISTS responses CASCADE;`);
+    console.log("🔄 Migration: ancienne table responses supprimée");
+  }
+
+  // 3. Créer la table responses avec la bonne structure
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS responses (
       id           TEXT PRIMARY KEY,
       exercise_id  TEXT NOT NULL REFERENCES exercises(id) ON DELETE CASCADE,
@@ -47,6 +63,7 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_responses_user ON responses(user_id);
   `);
 
+  // 4. Créer le compte admin par défaut
   const admin = await pool.query("SELECT id FROM users WHERE role='admin' LIMIT 1");
   if (!admin.rows.length) {
     const hash = await bcrypt.hash(process.env.ADMIN_PASSWORD || "Admin@2026", 10);
@@ -100,7 +117,7 @@ app.post("/api/auth/login", async (req, res) => {
 
 app.get("/api/auth/me", auth(), (req, res) => res.json(req.user));
 
-// USERS (admin)
+// USERS
 app.get("/api/users", auth(["admin"]), async (_, res) => {
   try {
     const { rows } = await pool.query("SELECT id,name,email,role,created_at FROM users ORDER BY created_at DESC");

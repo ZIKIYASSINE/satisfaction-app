@@ -16,15 +16,16 @@ const pool = new Pool({
 });
 
 async function initDB() {
-  // 1. Créer les nouvelles tables
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
-      id            TEXT PRIMARY KEY,
-      name          TEXT NOT NULL,
-      email         TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      role          TEXT NOT NULL DEFAULT 'user',
-      created_at    TIMESTAMPTZ DEFAULT NOW()
+      id                  TEXT PRIMARY KEY,
+      name                TEXT NOT NULL,
+      email               TEXT UNIQUE NOT NULL,
+      password_hash       TEXT NOT NULL,
+      role                TEXT NOT NULL DEFAULT 'user',
+      must_change_password BOOLEAN NOT NULL DEFAULT true,
+      last_login          TIMESTAMPTZ,
+      created_at          TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS exercises (
       id          TEXT PRIMARY KEY,
@@ -37,18 +38,21 @@ async function initDB() {
     );
   `);
 
-  // 2. Migration : supprimer l'ancienne table responses si elle a une structure incompatible
+  // Migration : ajouter must_change_password si colonne absente
+  await pool.query(`
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT true;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ;
+  `).catch(()=>{});
+
+  // Migration responses
   const cols = await pool.query(`
     SELECT column_name FROM information_schema.columns
     WHERE table_name='responses' AND column_name='user_id'
   `);
   if (cols.rows.length === 0) {
-    // Ancienne structure sans user_id → on recrée
     await pool.query(`DROP TABLE IF EXISTS responses CASCADE;`);
-    console.log("🔄 Migration: ancienne table responses supprimée");
   }
 
-  // 3. Créer la table responses avec la bonne structure
   await pool.query(`
     CREATE TABLE IF NOT EXISTS responses (
       id           TEXT PRIMARY KEY,
@@ -63,12 +67,12 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_responses_user ON responses(user_id);
   `);
 
-  // 4. Créer le compte admin par défaut
+  // Admin par défaut (must_change_password=false car admin connaît son mdp)
   const admin = await pool.query("SELECT id FROM users WHERE role='admin' LIMIT 1");
   if (!admin.rows.length) {
     const hash = await bcrypt.hash(process.env.ADMIN_PASSWORD || "Admin@2026", 10);
     await pool.query(
-      "INSERT INTO users (id,name,email,password_hash,role) VALUES ($1,$2,$3,$4,'admin')",
+      "INSERT INTO users (id,name,email,password_hash,role,must_change_password) VALUES ($1,$2,$3,$4,'admin',false)",
       [uuidv4(), "Administrateur", process.env.ADMIN_EMAIL || "admin@arwamedic.ma", hash]
     );
     console.log("✅ Admin créé: admin@arwamedic.ma / Admin@2026");
@@ -100,27 +104,65 @@ const auth = (roles = []) => (req, res, next) => {
 
 app.get("/health", (_, res) => res.json({ status: "ok", ts: new Date() }));
 
-// AUTH
+// ─── AUTH ─────────────────────────────────────────────────────────────────────
 app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Email et mot de passe requis" });
   try {
     const { rows } = await pool.query("SELECT * FROM users WHERE email=$1", [email.toLowerCase()]);
     if (!rows.length) return res.status(401).json({ error: "Identifiants incorrects" });
-    const ok = await bcrypt.compare(password, rows[0].password_hash);
-    if (!ok) return res.status(401).json({ error: "Identifiants incorrects" });
     const u = rows[0];
-    const token = jwt.sign({ id:u.id, name:u.name, email:u.email, role:u.role }, JWT_SECRET, { expiresIn:"7d" });
-    res.json({ token, user: { id:u.id, name:u.name, email:u.email, role:u.role } });
+    const ok = await bcrypt.compare(password, u.password_hash);
+    if (!ok) return res.status(401).json({ error: "Identifiants incorrects" });
+
+    // Mettre à jour last_login
+    await pool.query("UPDATE users SET last_login=NOW() WHERE id=$1", [u.id]);
+
+    const token = jwt.sign(
+      { id:u.id, name:u.name, email:u.email, role:u.role, mustChangePassword:u.must_change_password },
+      JWT_SECRET, { expiresIn:"7d" }
+    );
+    res.json({
+      token,
+      user: { id:u.id, name:u.name, email:u.email, role:u.role, mustChangePassword:u.must_change_password }
+    });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/api/auth/me", auth(), (req, res) => res.json(req.user));
 
-// USERS
+// Changement de mot de passe (première connexion ou volontaire)
+app.post("/api/auth/change-password", auth(), async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword)
+    return res.status(400).json({ error: "Mot de passe actuel et nouveau requis" });
+  if (newPassword.length < 6)
+    return res.status(400).json({ error: "Le nouveau mot de passe doit faire au moins 6 caractères" });
+  try {
+    const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [req.user.id]);
+    const ok = await bcrypt.compare(currentPassword, rows[0].password_hash);
+    if (!ok) return res.status(401).json({ error: "Mot de passe actuel incorrect" });
+    const hash = await bcrypt.hash(newPassword, 10);
+    await pool.query(
+      "UPDATE users SET password_hash=$1, must_change_password=false WHERE id=$2",
+      [hash, req.user.id]
+    );
+    // Nouveau token sans mustChangePassword
+    const u = rows[0];
+    const token = jwt.sign(
+      { id:u.id, name:u.name, email:u.email, role:u.role, mustChangePassword:false },
+      JWT_SECRET, { expiresIn:"7d" }
+    );
+    res.json({ token, user: { id:u.id, name:u.name, email:u.email, role:u.role, mustChangePassword:false } });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── USERS ────────────────────────────────────────────────────────────────────
 app.get("/api/users", auth(["admin"]), async (_, res) => {
   try {
-    const { rows } = await pool.query("SELECT id,name,email,role,created_at FROM users ORDER BY created_at DESC");
+    const { rows } = await pool.query(
+      "SELECT id,name,email,role,must_change_password,last_login,created_at FROM users ORDER BY created_at DESC"
+    );
     res.json(rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -131,7 +173,7 @@ app.post("/api/users", auth(["admin"]), async (req, res) => {
   try {
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query(
-      "INSERT INTO users (id,name,email,password_hash,role) VALUES ($1,$2,$3,$4,$5) RETURNING id,name,email,role,created_at",
+      "INSERT INTO users (id,name,email,password_hash,role,must_change_password) VALUES ($1,$2,$3,$4,$5,true) RETURNING id,name,email,role,must_change_password,created_at",
       [uuidv4(), name, email.toLowerCase(), hash, role]
     );
     res.status(201).json(rows[0]);
@@ -146,7 +188,11 @@ app.patch("/api/users/:id/password", auth(["admin"]), async (req, res) => {
   if (!password) return res.status(400).json({ error: "Mot de passe requis" });
   try {
     const hash = await bcrypt.hash(password, 10);
-    await pool.query("UPDATE users SET password_hash=$1 WHERE id=$2", [hash, req.params.id]);
+    // reset → force changement à la prochaine connexion
+    await pool.query(
+      "UPDATE users SET password_hash=$1, must_change_password=true WHERE id=$2",
+      [hash, req.params.id]
+    );
     res.json({ updated: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -158,7 +204,7 @@ app.delete("/api/users/:id", auth(["admin"]), async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// EXERCISES
+// ─── EXERCISES ────────────────────────────────────────────────────────────────
 app.get("/api/exercises", auth(), async (_, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM exercises ORDER BY created_at DESC");
@@ -176,7 +222,7 @@ app.get("/api/exercises/:id", auth(), async (req, res) => {
 
 app.post("/api/exercises", auth(["admin"]), async (req, res) => {
   const { title, month, year, questions } = req.body;
-  if (!title || month===undefined || !year || !questions) return res.status(400).json({ error: "Champs manquants" });
+  if (!title||month===undefined||!year||!questions) return res.status(400).json({ error: "Champs manquants" });
   try {
     const { rows } = await pool.query(
       "INSERT INTO exercises (id,title,month,year,questions,status) VALUES ($1,$2,$3,$4,$5,'active') RETURNING *",
@@ -190,7 +236,9 @@ app.patch("/api/exercises/:id/status", auth(["admin"]), async (req, res) => {
   const { status } = req.body;
   if (!["active","closed"].includes(status)) return res.status(400).json({ error: "Status invalide" });
   try {
-    const { rows } = await pool.query("UPDATE exercises SET status=$1 WHERE id=$2 RETURNING *", [status, req.params.id]);
+    const { rows } = await pool.query(
+      "UPDATE exercises SET status=$1 WHERE id=$2 RETURNING *", [status, req.params.id]
+    );
     res.json(rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -202,10 +250,10 @@ app.delete("/api/exercises/:id", auth(["admin"]), async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// RESPONSES
+// ─── RESPONSES ────────────────────────────────────────────────────────────────
 app.post("/api/exercises/:id/responses", auth(), async (req, res) => {
   const { answers, percentage } = req.body;
-  if (!answers || percentage===undefined) return res.status(400).json({ error: "Données manquantes" });
+  if (!answers||percentage===undefined) return res.status(400).json({ error: "Données manquantes" });
   try {
     const ex = await pool.query("SELECT * FROM exercises WHERE id=$1", [req.params.id]);
     if (!ex.rows.length) return res.status(404).json({ error: "Exercice introuvable" });
@@ -243,7 +291,7 @@ app.get("/api/exercises/:id/my-response", auth(), async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// STATS
+// ─── STATS ────────────────────────────────────────────────────────────────────
 app.get("/api/stats", auth(["admin"]), async (req, res) => {
   try {
     const year = parseInt(req.query.year) || new Date().getFullYear();
@@ -260,14 +308,16 @@ app.get("/api/stats", auth(["admin"]), async (req, res) => {
         avg: rInQ.length ? Math.round(rInQ.reduce((a,r)=>a+r.percentage,0)/rInQ.length) : 0 };
     }
     const all = await pool.query("SELECT percentage FROM responses");
-    const globalAvg = all.rows.length ? Math.round(all.rows.reduce((a,r)=>a+r.percentage,0)/all.rows.length) : 0;
-    const totalUsers = (await pool.query("SELECT COUNT(*) FROM users WHERE role='user'")).rows[0].count;
+    const globalAvg = all.rows.length
+      ? Math.round(all.rows.reduce((a,r)=>a+r.percentage,0)/all.rows.length) : 0;
+    const totalUsers    = (await pool.query("SELECT COUNT(*) FROM users WHERE role='user'")).rows[0].count;
+    const pendingChange = (await pool.query("SELECT COUNT(*) FROM users WHERE must_change_password=true")).rows[0].count;
     res.json({ year, globalAvg, totalResponses:all.rows.length,
       totalExercises:(await pool.query("SELECT COUNT(*) FROM exercises")).rows[0].count,
-      totalUsers, quarters:qStats });
+      totalUsers, pendingChange, quarters:qStats });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-initDB().then(() => app.listen(PORT, () => console.log(`🚀 API on port ${PORT}`))).catch(err=>{
+initDB().then(()=>app.listen(PORT,()=>console.log(`🚀 API on port ${PORT}`))).catch(err=>{
   console.error("❌ DB init failed:", err); process.exit(1);
 });

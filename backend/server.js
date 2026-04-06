@@ -44,6 +44,11 @@ async function initDB() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ;
   `).catch(()=>{});
 
+  // Migration : ajouter comments si colonne absente
+  await pool.query(`
+    ALTER TABLE responses ADD COLUMN IF NOT EXISTS comments JSONB NOT NULL DEFAULT '{}';
+  `).catch(()=>{});
+
   // Migration responses
   const cols = await pool.query(`
     SELECT column_name FROM information_schema.columns
@@ -59,6 +64,7 @@ async function initDB() {
       exercise_id  TEXT NOT NULL REFERENCES exercises(id) ON DELETE CASCADE,
       user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       answers      JSONB NOT NULL DEFAULT '{}',
+      comments     JSONB NOT NULL DEFAULT '{}',
       percentage   INTEGER NOT NULL,
       submitted_at TIMESTAMPTZ DEFAULT NOW(),
       UNIQUE(exercise_id, user_id)
@@ -252,18 +258,18 @@ app.delete("/api/exercises/:id", auth(["admin"]), async (req, res) => {
 
 // ─── RESPONSES ────────────────────────────────────────────────────────────────
 app.post("/api/exercises/:id/responses", auth(), async (req, res) => {
-  const { answers, percentage } = req.body;
+  const { answers, comments={}, percentage } = req.body;
   if (!answers||percentage===undefined) return res.status(400).json({ error: "Données manquantes" });
   try {
     const ex = await pool.query("SELECT * FROM exercises WHERE id=$1", [req.params.id]);
     if (!ex.rows.length) return res.status(404).json({ error: "Exercice introuvable" });
     if (ex.rows[0].status==="closed") return res.status(403).json({ error: "Enquête fermée" });
     const { rows } = await pool.query(
-      `INSERT INTO responses (id,exercise_id,user_id,answers,percentage)
-       VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (exercise_id,user_id) DO UPDATE SET answers=$4,percentage=$5,submitted_at=NOW()
+      `INSERT INTO responses (id,exercise_id,user_id,answers,comments,percentage)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (exercise_id,user_id) DO UPDATE SET answers=$4,comments=$5,percentage=$6,submitted_at=NOW()
        RETURNING *`,
-      [uuidv4(), req.params.id, req.user.id, JSON.stringify(answers), percentage]
+      [uuidv4(), req.params.id, req.user.id, JSON.stringify(answers), JSON.stringify(comments), percentage]
     );
     res.status(201).json(rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }

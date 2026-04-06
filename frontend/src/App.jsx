@@ -280,6 +280,7 @@ function SurveyPage({ exerciseId, user, onBack }) {
   const [exercise, setExercise] = useState(null);
   const [loading, setLoading]   = useState(true);
   const [answers, setAnswers]   = useState({});
+  const [comments, setComments] = useState({});
   const [done, setDone]         = useState(false);
   const [existing, setExisting] = useState(null);
   const [submitting, setSubmitting] = useState(false);
@@ -303,7 +304,7 @@ function SurveyPage({ exerciseId, user, onBack }) {
     try {
       const scores = qs.map(q=>answers[q.id]||0);
       const pct = Math.round((scores.reduce((a,b)=>a+b,0)/(qs.length*5))*100);
-      const resp = await api.submitResponse(exerciseId, { answers, percentage:pct });
+      const resp = await api.submitResponse(exerciseId, { answers, comments, percentage:pct });
       setExisting(resp); setDone(true);
     } catch(e) { alert(e.message); }
     finally { setSubmitting(false); }
@@ -375,6 +376,25 @@ function SurveyPage({ exerciseId, user, onBack }) {
               <span style={{color:"#0e5ba8",marginRight:8}}>Q{i+1}.</span>{q.text}
             </p>
             <EmojiPicker value={answers[q.id]||0} onChange={v=>setAnswers(p=>({...p,[q.id]:v}))}/>
+            {/* Commentaire optionnel */}
+            <div style={{marginTop:14,borderTop:"1px dashed #e2e8f0",paddingTop:12}}>
+              <label style={{fontSize:11,color:"#94a3b8",display:"block",marginBottom:6}}>
+                💬 Commentaire (optionnel)
+              </label>
+              <textarea
+                value={comments[q.id]||""}
+                onChange={e=>setComments(p=>({...p,[q.id]:e.target.value}))}
+                placeholder="Partagez un commentaire sur ce point..."
+                rows={2}
+                style={{width:"100%",boxSizing:"border-box",padding:"8px 12px",
+                  fontSize:12,color:"#1a1a2e",background:"#f8f9fa",
+                  border:"1px solid #e2e8f0",borderRadius:8,resize:"vertical",
+                  outline:"none",fontFamily:"inherit",lineHeight:1.5,
+                  transition:"border-color .2s"}}
+                onFocus={e=>e.target.style.borderColor="#0e5ba8"}
+                onBlur={e=>e.target.style.borderColor="#e2e8f0"}
+              />
+            </div>
           </div>
         ))}
       </div>
@@ -638,15 +658,44 @@ function AdminApp({ user, onLogout, initialSurveyId }) {
                   {resps.length>0&&(
                     <div style={{marginBottom:14}}>
                       <p style={{fontSize:11,color:"#64748b",fontWeight:600,marginBottom:8,textTransform:"uppercase",letterSpacing:.4}}>Réponses nominatives</p>
-                      <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
-                        {resps.map(r=>(
-                          <div key={r.id} style={{display:"flex",alignItems:"center",gap:6,padding:"4px 10px",
-                            background:"#f8f9fa",borderRadius:20,border:"1px solid #e2e8f0"}}>
-                            <span style={{width:6,height:6,borderRadius:"50%",background:getColor(r.percentage),display:"inline-block"}}/>
-                            <span style={{fontSize:11,color:"#1a1a2e"}}>{r.user_name}</span>
-                            <span style={{fontSize:11,fontWeight:600,color:getColor(r.percentage)}}>{r.percentage}%</span>
-                          </div>
-                        ))}
+                      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                        {resps.map(r=>{
+                          const hasComments = r.comments && Object.values(r.comments).some(c=>c&&c.trim());
+                          return (
+                            <div key={r.id} style={{background:"#f8f9fa",borderRadius:8,border:"1px solid #e2e8f0",padding:"10px 14px"}}>
+                              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:hasComments?8:0}}>
+                                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                                  <div style={{width:28,height:28,borderRadius:"50%",background:"#e6f1fb",
+                                    display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:600,color:"#0e5ba8"}}>
+                                    {r.user_name.charAt(0).toUpperCase()}
+                                  </div>
+                                  <span style={{fontSize:12,fontWeight:500,color:"#1a1a2e"}}>{r.user_name}</span>
+                                  <span style={{fontSize:10,color:"#94a3b8"}}>{r.user_email}</span>
+                                </div>
+                                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                                  {hasComments && <span style={{fontSize:10,color:"#64748b"}}>💬 commentaires</span>}
+                                  <span style={{fontSize:14,fontWeight:700,color:getColor(r.percentage)}}>{r.percentage}%</span>
+                                  <span style={{fontSize:10,padding:"2px 8px",borderRadius:20,background:getBg(r.percentage),color:getColor(r.percentage),fontWeight:600}}>{getLabel(r.percentage)}</span>
+                                </div>
+                              </div>
+                              {hasComments && (
+                                <div style={{display:"flex",flexDirection:"column",gap:4,paddingLeft:36}}>
+                                  {(ex.questions||[]).map(q=>{
+                                    const c = (r.comments||{})[q.id];
+                                    if (!c||!c.trim()) return null;
+                                    return (
+                                      <div key={q.id} style={{fontSize:11,color:"#475569",lineHeight:1.5}}>
+                                        <span style={{color:"#0e5ba8",fontWeight:500,marginRight:6}}>Q{(ex.questions||[]).indexOf(q)+1}.</span>
+                                        <span style={{color:"#64748b",marginRight:6}}>{q.text} :</span>
+                                        <span style={{fontStyle:"italic",color:"#1a1a2e"}}>"{c.trim()}"</span>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
                   )}
